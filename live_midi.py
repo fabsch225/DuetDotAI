@@ -58,6 +58,16 @@ def main():
     if not args.midi_in or not args.midi_out:
         ap.error("--midi-in and --midi-out are required (use --list-ports to see choices)")
 
+    # Resolve by substring, not just exact match: a port name with
+    # non-ASCII characters (e.g. GarageBand's "virtueller Eingang", which
+    # uses an en dash) doesn't reliably survive a terminal copy-paste
+    # byte-for-byte, so an ASCII-safe substring like "GarageBand" is more
+    # robust than requiring the exact name from --list-ports. Do this
+    # before loading the model so a typo fails in a second, not a minute.
+    ports = midi_io.list_ports()
+    midi_in_name = midi_io.resolve_port(args.midi_in, ports["inputs"], "input")
+    midi_out_name = midi_io.resolve_port(args.midi_out, ports["outputs"], "output")
+
     accomp_instrs = ENSEMBLE_ACCOMP_INSTRS if args.ensemble else SOLO_ACCOMP_INSTRS
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -75,9 +85,9 @@ def main():
     # Shared clock: opened before the blocking duet.run() call so the MIDI
     # input/output threads and the scheduler all agree on what "now" means.
     t0 = time.monotonic()
-    midi_in = midi_io.MidiKeyboardInput(args.midi_in, t0)
+    midi_in = midi_io.MidiKeyboardInput(midi_in_name, t0)
     channel_by_instr = {MELODY_INSTR: 0, **{instr: i + 1 for i, instr in enumerate(accomp_instrs)}}
-    midi_out = midi_io.MidiPlayer(args.midi_out, t0, channel_by_instr)
+    midi_out = midi_io.MidiPlayer(midi_out_name, t0, channel_by_instr)
     for instr in accomp_instrs:
         midi_out.set_program(instr, instr)
 
@@ -114,7 +124,7 @@ def main():
     voices = ", ".join(INSTR_NAMES.get(i, str(i)) for i in accomp_instrs)
     voicing = "polyphonic (multiple violins)" if args.multi_voice else "monophonic (one violin)"
     print(f"companion voice(s): {voices} -- {voicing}")
-    print(f"listening on '{args.midi_in}', playing to '{args.midi_out}'")
+    print(f"listening on '{midi_in_name}', playing to '{midi_out_name}'")
     print(f"quiet for the first {args.listen_first_beats} beats while it listens -- play now. Ctrl+C to stop.")
 
     try:
@@ -133,9 +143,12 @@ def main():
         f"(realtime factor {rtf:.2f}x), underruns: {duet.underruns}"
     )
 
-    midi_path = outdir / "live_midi_session.mid"
-    events_to_midi(ops.sort(duet.history)).save(str(midi_path))
-    print(f"wrote {midi_path}")
+    if duet.history:
+        midi_path = outdir / "live_midi_session.mid"
+        events_to_midi(ops.sort(duet.history)).save(str(midi_path))
+        print(f"wrote {midi_path}")
+    else:
+        print("nothing was played -- no MIDI file written")
 
 
 if __name__ == "__main__":

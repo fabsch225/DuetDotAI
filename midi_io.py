@@ -20,6 +20,26 @@ def list_ports():
     return {"inputs": mido.get_input_names(), "outputs": mido.get_output_names()}
 
 
+def resolve_port(name, available, kind):
+    """Match `name` against `available` port names -- exact match first,
+    then case-insensitive substring. Names with non-ASCII characters (e.g.
+    GarageBand's German-localized "virtueller Eingang", which uses an en
+    dash) don't reliably round-trip byte-for-byte through a terminal
+    copy-paste -- the shell's encoding of what you typed doesn't always
+    match what CoreMIDI actually registered, so an exact-match-only lookup
+    fails on a port name that's right there in --list-ports' own output.
+    Matching by an ASCII-safe substring (e.g. "GarageBand") sidesteps the
+    problem instead of asking the user to type the exact character."""
+    if name in available:
+        return name
+    matches = [p for p in available if name.lower() in p.lower()]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise SystemExit(f"no {kind} port matches {name!r}. Available: {available}")
+    raise SystemExit(f"{name!r} matches multiple {kind} ports, be more specific: {matches}")
+
+
 class MidiKeyboardInput:
     """Listens to a real MIDI input port on a background thread (mido's
     callback runs on its own thread) and exposes completed notes as
