@@ -34,6 +34,7 @@ is written out as a MIDI file.
 """
 
 import argparse
+import heapq
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -88,7 +89,7 @@ def _generate_nonsilent(model, gen_start, gen_end, commit_end, inputs, accomp_in
     for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
         result = generate_duet(model, gen_start, gen_end, inputs, accomp_instrs, top_p, accomp_bias)
         has_note = any(
-            instr in accomp_instrs and gen_start < t <= commit_end
+            instr in accomp_instrs and gen_start <= t < commit_end
             for t, _, instr, _ in parse_events(result)
         )
         if has_note or attempt == MAX_GENERATION_ATTEMPTS:
@@ -134,6 +135,12 @@ class LiveDuet:
                  commit_beats, listen_first_beats, top_p, accomp_instrs=STRING_ENSEMBLE_ACCOMP_INSTRS,
                  accomp_bias=ACCOMP_BIAS, polyphonic=False, on_played=None, t0=None,
                  poll_interval=0.05):
+        if bpm <= 0 or commit_beats <= 0 or lookahead_beats < commit_beats:
+            raise ValueError("Require bpm > 0 and 0 < commit beats <= lookahead beats")
+        if listen_first_beats < lookahead_beats:
+            raise ValueError("Listen-first beats must be at least lookahead beats")
+        if not 0 < top_p <= 1:
+            raise ValueError("top_p must be in (0, 1]")
         self.model = model
         self.melody_source = melody_source
         self.melody_len_s = melody_len_s
@@ -151,14 +158,17 @@ class LiveDuet:
         self.history = []            # revealed melody + committed accompaniment (raw tokens)
         self.committed_horizon = self.listen_first_s
         self.played = []             # (onset_s, dur_s, role, pitch) -- for the live log only
-        self.announced = 0           # index into self.played already logged as "sounding"
+        self._melody_refs = {}       # live note id -> (duration token index, played index)
+        self._announcements = []
+        self.announced = 0           # count of events announced in onset order
         self._stop_requested = False
 
         self.pool = ThreadPoolExecutor(max_workers=1)
         self.pending = None          # (future, gen_start, gen_end, wall_start)
 
-        self.gen_stats = []          # (music_s_requested, wall_s_taken)
+        self.gen_stats = []          # (committed timeline seconds, wall seconds)
         self.underruns = 0
+        self.dropped_expired = 0
         # Normally set fresh in run(). Injectable so a caller (live_midi.py)
         # can open real MIDI ports against the exact same clock *before*
         # the blocking run() call starts -- there's no other way to hand
@@ -174,6 +184,7 @@ class LiveDuet:
         # when self.polyphonic=True ("multiple violins" -- see that method).
         self._voice_last_end = {}    # instr -> end time (s) of its last committed note
         self._voice_prev_onset = {}  # instr -> onset time (s) of its last committed note
+        self._voice_played_idx = {}
         self._voice_dur_idx = {}     # instr -> history index of that note's duration token
 
     def log(self, msg):
@@ -198,27 +209,43 @@ class LiveDuet:
         # no more melody to inform them, and the piece balloons well past
         # the melody's own length purely because generation was fast.
         self.tail_s = self.lookahead_s + 2.0
-        while True:
-            playhead = time.monotonic() - self.t0
-            if self._stop_requested:
-                break
-            if self.melody_len_s is not None and self.melody_source.exhausted() \
-                    and playhead > self.melody_len_s + self.tail_s:
-                break
-
-            self._reveal_melody(playhead)
-            self._maybe_kick_generation(playhead)
-            self._collect_generation()
-            self._announce_due(playhead)
-
-            time.sleep(self.poll_interval)
-
-        self.pool.shutdown(wait=True)
+        try:
+            while not self._stop_requested:
+                playhead = time.monotonic() - self.t0
+                if self.melody_len_s is not None and self.melody_source.exhausted() \
+                        and playhead > self.melody_len_s + self.tail_s:
+                    break
+                self._reveal_melody(playhead)
+                self._collect_generation()
+                self._maybe_kick_generation(playhead)
+                self._announce_due(playhead)
+                time.sleep(self.poll_interval)
+        finally:
+            # Let the caller silence hardware immediately. An in-flight model call
+            # cannot be interrupted safely; its result will no longer be played.
+            self.pool.shutdown(wait=False, cancel_futures=True)
 
     def _reveal_melody(self, playhead):
-        for onset_s, dur_s, pitch in self.melody_source.poll(playhead):
+        for event in self.melody_source.poll(playhead):
+            if isinstance(event, dict):
+                onset_s, dur_s, pitch = event["onset"], event["duration"], event["pitch"]
+                note_id = event["id"]
+                refs = self._melody_refs.get(note_id)
+                if refs is not None:
+                    dur_idx, played_idx = refs
+                    self.history[dur_idx] = make_event(onset_s, dur_s, MELODY_INSTR, pitch)[1]
+                    self.played[played_idx] = (onset_s, dur_s, "melody", pitch)
+                    if event["complete"]:
+                        del self._melody_refs[note_id]
+                    continue
+            else:
+                onset_s, dur_s, pitch = event
+                note_id = None
             self.history.extend(make_event(onset_s, dur_s, MELODY_INSTR, pitch))
             self.played.append((onset_s, dur_s, "melody", pitch))
+            if note_id is not None and not event["complete"]:
+                self._melody_refs[note_id] = (len(self.history) - 2, len(self.played) - 1)
+            heapq.heappush(self._announcements, (onset_s, len(self.played) - 1))
             self.on_played(onset_s, dur_s, "melody", pitch)
 
     def _maybe_kick_generation(self, playhead):
@@ -239,10 +266,15 @@ class LiveDuet:
         if self.melody_len_s is not None and self.committed_horizon >= self.melody_len_s + self.tail_s:
             return
 
-        # Pipeline continuously from then on: start the next chunk the moment
-        # the previous one lands, so the model is never idle while there is
-        # still more accompaniment to plan.
-        gen_start = self.committed_horizon
+        # Keep committed audio close to the performer. A fast model must wait
+        # for fresh input rather than accumulating minutes of frozen music.
+        # Keep at most lookahead + one commit ahead; lookahead is the
+        # compute cushion before the next window begins.
+        if self.committed_horizon > playhead + self.lookahead_s:
+            return
+        # After an underrun, recover at the current transport instead of spending
+        # subsequent calls generating windows that are already in the past.
+        gen_start = max(self.committed_horizon, playhead)
         gen_end = gen_start + self.lookahead_s
         commit_end = gen_start + self.commit_s
 
@@ -276,24 +308,29 @@ class LiveDuet:
         if window_start > 0:
             result = ops.translate(result, window_start, seconds=True)  # back to absolute time
         wall_dt = time.monotonic() - wall_start
-        self.gen_stats.append((gen_end - gen_start, wall_dt))
+        self.gen_stats.append((self.commit_s, wall_dt))
 
         commit_end = gen_start + self.commit_s
         committed = [
             (t, d, instr, p) for (t, d, instr, p) in parse_events(result)
-            if instr in self.accomp_instrs and gen_start < t <= commit_end
+            if instr in self.accomp_instrs and gen_start <= t < commit_end
         ]
 
-        # A note is "late" if its cue has already passed by the time the
-        # model finished -- a genuine scheduling underrun. In a real
-        # live rig with a fixed-size playback buffer it would be inaudible;
-        # here we still keep it (at its original musical position) so the
-        # MIDI reflects what the model actually wrote, and count it below so
-        # the underrun rate stays an honest measure of real-time viability.
+        # Count late model output before dropping/shortening expired events,
+        # so recovery never hides a missed playback deadline in the statistics.
         collect_time = time.monotonic() - self.t0
         late = sum(1 for (t, _, _, _) in committed if t < collect_time)
 
-        self._commit_accompaniment(committed)
+        # Never send expired notes as an audible burst. Notes that are still
+        # useful enter now and retain their original end, matching live playback.
+        audible = []
+        for t, d, instr, p in committed:
+            if t + d <= collect_time:
+                self.dropped_expired += 1
+                continue
+            onset = max(t, collect_time)
+            audible.append((onset, t + d - onset, instr, p))
+        self._commit_accompaniment(audible)
         self.committed_horizon = commit_end
 
         tag = "ok" if not late else f"UNDERRUN ({late} note(s) arrived after their cue)"
@@ -335,6 +372,9 @@ class LiveDuet:
                     if onset_s < self._voice_last_end[instr]:
                         trimmed_s = onset_s - prev_onset
                         self.history[self._voice_dur_idx[instr]] = DUR_OFFSET + round(trimmed_s * TIME_RESOLUTION)
+                        idx = self._voice_played_idx[instr]
+                        previous = self.played[idx]
+                        self.played[idx] = (previous[0], trimmed_s, previous[2], previous[3])
 
             self.history.extend(make_event(onset_s, dur_s, instr, pitch))
 
@@ -342,14 +382,17 @@ class LiveDuet:
                 self._voice_dur_idx[instr] = len(self.history) - 2  # the triple's middle (duration) slot
                 self._voice_prev_onset[instr] = onset_s
                 self._voice_last_end[instr] = onset_s + dur_s
+                self._voice_played_idx[instr] = len(self.played)
 
             role = f"accomp:{instr}"
             self.played.append((onset_s, dur_s, role, pitch))
+            heapq.heappush(self._announcements, (onset_s, len(self.played) - 1))
             self.on_played(onset_s, dur_s, role, pitch)
 
     def _announce_due(self, playhead):
-        while self.announced < len(self.played) and self.played[self.announced][0] <= playhead:
-            onset_s, dur_s, role, pitch = self.played[self.announced]
+        while self._announcements and self._announcements[0][0] <= playhead:
+            _, idx = heapq.heappop(self._announcements)
+            onset_s, dur_s, role, pitch = self.played[idx]
             if role == "melody":
                 marker = "YOU        "
             else:
@@ -444,8 +487,8 @@ def main():
     rtf = total_music_s / total_wall_s if total_wall_s > 0 else float("inf")
     print(
         f"inference calls: {len(duet.gen_stats)}, "
-        f"music generated: {total_music_s:.1f}s in {total_wall_s:.1f}s wall time "
-        f"(realtime factor {rtf:.2f}x), underruns: {duet.underruns}"
+        f"music committed: {total_music_s:.1f}s in {total_wall_s:.1f}s wall time "
+        f"(committed-time throughput {rtf:.2f}x), underruns: {duet.underruns}, expired notes dropped: {duet.dropped_expired}"
     )
 
     midi_path = outdir / "live_duet.mid"

@@ -1,129 +1,125 @@
-# Playing live with a physical MIDI keyboard
+# Run the duet locally
 
-`live_duet.py` plays against a synthetic melody for benchmarking. `live_midi.py`
-is the same scheduler (`LiveDuet`) wired to a real MIDI keyboard input and a
-real MIDI output instead -- this is how you actually try it live.
+## This Mac
 
-## 1. Install
+The local environment and AMT checkpoint have been prepared in `.venv/` and
+`.model-cache/`. From Terminal:
 
-```bash
-pip install torch transformers musicpy mido python-rtmidi
-pip install git+https://github.com/jthickstun/anticipation.git
+```sh
+cd /Users/weronikazygis/Desktop/projects/DuetDotAI
+./run_local.sh --list-ports
 ```
 
-`python-rtmidi` is the part that actually talks to hardware -- `mido` alone
-can only read/write `.mid` files.
+Connect the USB MIDI keyboard. In Audio MIDI Setup, open MIDI Studio, enable the
+IAC Driver, and note the port names printed by the command above. Start with:
 
-## 2. Plug in your keyboard
-
-Any class-compliant USB-MIDI keyboard just works over USB. If yours only has
-5-pin DIN MIDI ports, you need a USB-MIDI interface between it and the Mac.
-
-Check the machine sees it:
-
-```bash
-python live_midi.py --list-ports
+```sh
+./run_local.sh --midi-in "Your keyboard port" --midi-out "IAC Driver Bus 1" \
+  --solo --bpm 80 --lookahead-beats 4 --commit-beats 2 --no-program-change
 ```
 
-You should see your keyboard's name under `inputs`. If it's not there,
-check the cable/interface before going further -- nothing past this point
-will work without it.
+Use your actual port names (unique substrings work). The companion listens for
+8 beats before entering. Play to an 80 BPM metronome. Ctrl+C stops playback;
+the process may take a little longer to exit while a model call finishes.
+The session is exported to `output/live_midi_session.mid`.
 
-## 3. Set up somewhere to actually hear the companion
+`--no-program-change` preserves the instrument preset selected in your DAW.
+It is useful for your musician's custom instrument. Without it, the app sends
+General MIDI program changes for violin/viola/cello. The model's instrument
+labels and your chosen playback sound can be different.
 
-The companion's notes go out as real MIDI on `--midi-out`; something has to
-turn that into sound. Two options:
+## Hear it in GarageBand
 
-**A hardware synth or module** -- if you have one, plug it in via
-USB-MIDI or a DIN interface, and use its port name directly for
-`--midi-out`. Simplest option, skip to step 4.
+The app sends companion MIDI; it does not render audio or echo your own piano.
+Create a software instrument track, select an audible instrument, and ensure it
+receives the companion's virtual MIDI output. GarageBand has limited MIDI input
+filtering/routing: do not assume it can independently filter each track by input
+port. Confirm that playing the human keyboard does not also trigger the
+companion sound. If necessary use the keyboard's own audio for the human part
+and a host with explicit port/channel filtering for the companion.
 
-**Route into GarageBand (or any DAW) via a virtual MIDI bus** -- macOS's
-built-in IAC Driver does this for free:
+Audio Unit (AU) instrument plugins can render MIDI on a software instrument
+track. A VST-only plugin needs a compatible host; MIDI files are note sequences,
+not instrument plugins. A sample library needs its compatible sampler.
 
-1. Open **Audio MIDI Setup** (Spotlight it). **Window > Show MIDI Studio**.
-2. Double-click the **IAC Driver** icon.
-3. Check **"Device is online"**. Leave the default port ("Bus 1").
-4. In GarageBand: **Track > New Track > Software Instrument**. Click the
-   track's instrument slot and pick something with an actual loaded sound
-   (Strings/Violin is the obvious choice, but anything works) -- per the
-   GarageBand MIDI-import gotcha noted in the main README, a track can look
-   fine but have no instrument actually loaded; check it plays a note if
-   you're not sure.
-5. In that track's input settings (or GarageBand's own MIDI input routing,
-   depending on version), select **IAC Driver, Bus 1** as the input source.
+For Morpho: load the AU effect AFTER the software instrument on the companion
+track. Morpho processes audio, so feeding it MIDI alone will not make sound.
+Keep the human piano on a separate audio path. Start with a clear pitched model
+and modest wet/dry blend, then audition more experimental sounds.
 
-Your keyboard should keep going straight into its own sound (or your amp,
-or a separate GarageBand track set to your keyboard's own port) -- this
-tool doesn't echo your own notes back out anywhere, only the companion's.
+## LYDIA connection
 
-## 4. Run it
+Use LYDIA as an audio processor for the generated companion:
 
-```bash
-python live_midi.py --midi-in "Your Keyboard" --midi-out "IAC Driver Bus 1"
+Keyboard MIDI -> AMT -> companion synth -> audio output -> LYDIA audio input
+-> LYDIA audio output -> mixer/speakers.
+
+Mix the human piano separately. Do not feed LYDIA's processed output back into
+its own input. An interface with separate outputs helps send only the companion
+to LYDIA. Phase I uses an external USB audio interface; Phase II has integrated
+audio I/O. Ask the Roland team which prototype you have, which connectors and
+levels to use, and which models/macros it exposes. Knobs/MIDI parameter maps
+and model-loading support depend on that prototype. The laptop still generates
+notes; this setup does not put AMT on LYDIA.
+
+## Test without a keyboard
+
+```sh
+./run_local.sh --test
+./run_local.sh --demo
 ```
 
-The default companion is a string ensemble (violin, viola, cello) -- a lone
-violin was consistently too quiet to hear against a real performance. Add
-`--solo` to drop back to one violin, and/or `--multi-voice` to let a given
-instrument overlap itself (a section instead of a soloist) -- same two
-independent flags as `live_duet.py`.
+The demo runs the real AMT model on a synthetic melody and saves
+`output/live_duet.mid`; it does not play audio. Drag that MIDI into your DAW to
+listen. Apple Silicon acceleration is chosen automatically when available.
+The first model load/warmup happens before the timed performance.
 
-It loads the model, does a brief silent soundcheck, then prints something
-like:
+## Install on another Mac
 
+Use Python 3.10-3.12 and Git. In the project directory:
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+./run_local.sh --demo
 ```
-companion voice(s): violin, viola, cello -- monophonic (one violin)
-listening on 'Your Keyboard', playing to 'IAC Driver Bus 1'
-quiet for the first 8.0 beats while it listens -- play now. Ctrl+C to stop.
-```
 
-Play. **Press Ctrl+C when you're done** -- this ends the session cleanly and
-writes a MIDI file of the whole thing (your part and the companion's) to
-`--outdir` (`output/live_midi_session.mid` by default), same as the
-synthetic demo.
+The first demo downloads the checkpoint into `.model-cache/`; later runs use the
+cache. The prepared environment on this Mac reuses its existing Python packages.
 
-## What to actually expect
+## Current behavior and limits
 
-- **Silence for the first few bars.** This is deliberate (the "listen
-  first" window from `proposal.md` -- see the main README) -- it's
-  gathering context before it plays its first note, not broken.
-- **A reaction delay equal to how long you hold each note.** The scheduler
-  works with (onset, duration) pairs, so a note you're playing only becomes
-  visible to the model once you release it (`midi_io.py`'s
-  `MidiKeyboardInput` only completes a note on `note_off`). Short notes
-  barely matter; a long held note delays the model's reaction to it by
-  exactly how long you hold it.
-- **`--bpm` is a scheduling assumption, not a detector.** It sets how many
-  real seconds the lookahead/commit/listen-first windows are (in beats);
-  it doesn't listen to your actual tempo. Play along to a metronome at
-  that BPM for the timing to line up with what the model expects; per
-  `proposal.md`, beat-tracking free tempo in real time is a much harder,
-  separate problem this doesn't attempt to solve.
-- **A long pause you take mid-session doesn't stop it from planning
-  ahead.** Unlike the synthetic demo (which has a known melody length and
-  stops generating a fixed tail past the end), a live session has no known
-  end, so the model just keeps writing plausible continuations even through
-  silence -- it'll have plenty ready the moment you start again.
-- **The console log is the same live feed as the synthetic demo** --
-  `YOU`/`AI(instrument)` lines with timestamps, generation wall-times, and
-  underrun warnings if the model falls behind the buffer on your machine.
+- No Space, Temperature, or Genre controls were added in this update.
+- Live note attacks reach the model before release. Held notes have one stable
+  identity and an estimated duration updated while held, then finalized on key
+  release. MIDI velocity is retained at input but output remains velocity 80.
+- Sustain-pedal CC is not modeled; duration represents physical key-down time.
+- Model duration tokens cap very long held notes to the vocabulary's maximum.
+- Committed music stays within lookahead plus one commit window of playback.
+  This trades response speed against compute cushion; it does not eliminate
+  musical reaction delay. BPM is fixed, not inferred from playing.
+- Expired generated notes are dropped instead of firing in a late burst.
+  Partly late notes keep their original end time. Recovery advances to the
+  current playhead instead of repeatedly generating already-expired windows.
+- Monophonic playback stops the previous note on the same output channel.
+  Different ensemble channels stay independent; `--multi-voice` enables overlap.
+- Performance reports count committed timeline duration, excluding discarded
+  lookahead. Historical README benchmarks used a different, optimistic measure.
+- Solo is the recommended first soundcheck. Ensemble generation may need more
+  compute. A short passing run is not a guarantee of a two-minute live performance.
 
-## Troubleshooting
+Official references:
+- https://neutone.jp/morpho
+- https://articles.roland.com/project-lydia-phase-ii-neural-sampling-evolved/
+- https://developer.apple.com/library/archive/documentation/MusicAudio/Conceptual/CoreAudioOverview/WhatisCoreAudio.html
 
-- **My keyboard doesn't show up in `--list-ports`.** Check it works in
-  another app first (GarageBand's own MIDI input, or Audio MIDI Setup's
-  MIDI Studio window, which shows connected devices). USB-MIDI should be
-  plug-and-play on macOS; if it's not appearing, it's a cable/driver
-  problem, not this script.
-- **I hear nothing from the companion.** Check, in order: the output
-  port name is exactly right (copy-paste from `--list-ports`, don't
-  retype it); the GarageBand track's input is actually set to that IAC bus;
-  the track actually has an instrument loaded (see step 3); the track
-  isn't muted and no other track has Solo engaged.
-- **It feels unresponsive / laggy.** Check the console log for `UNDERRUN`
-  lines -- that means the model isn't keeping up with the buffer on your
-  hardware. Try `--lookahead-beats 2 --commit-beats 1.5` (smaller windows,
-  less to compute per cycle), a slower `--bpm`, or `--solo` -- the default
-  3-instrument ensemble is a harder generation problem than one violin and
-  measurably more underrun-prone (realtime factor ~0.6-1.0x vs. 2-4x solo).
+## Validation on this Mac, September 12
+
+- 15 regression tests passed in the installed environment.
+- Real AMT ran with MPS acceleration.
+- A 120-second end-to-end test used isolated CoreMIDI input and output ports:
+  142 input notes, 45 companion note attacks, 78 generation calls, zero missed
+  note deadlines, zero expired notes, no simultaneous voices on the solo
+  channel, and no notes left on after shutdown.
+- This verifies timing and MIDI delivery for that test, not musical quality or
+  physical keyboard/DAW/LYDIA latency. No external MIDI devices were present.

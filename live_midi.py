@@ -35,6 +35,8 @@ def main():
     ap.add_argument("--list-ports", action="store_true", help="print available MIDI ports and exit")
     ap.add_argument("--midi-in", help="MIDI input port name (your keyboard)")
     ap.add_argument("--midi-out", help="MIDI output port name (a synth, or a virtual bus into a DAW)")
+    ap.add_argument("--no-program-change", action="store_true",
+                     help="keep the sound already selected in your synth/DAW")
     ap.add_argument("--bpm", type=float, default=80.0,
                      help="assumed tempo for scheduling math only -- play along to a "
                           "metronome at this tempo for the lookahead/commit timing to "
@@ -87,9 +89,10 @@ def main():
     t0 = time.monotonic()
     midi_in = midi_io.MidiKeyboardInput(midi_in_name, t0)
     channel_by_instr = {MELODY_INSTR: 0, **{instr: i + 1 for i, instr in enumerate(accomp_instrs)}}
-    midi_out = midi_io.MidiPlayer(midi_out_name, t0, channel_by_instr)
-    for instr in accomp_instrs:
-        midi_out.set_program(instr, instr)
+    midi_out = midi_io.MidiPlayer(midi_out_name, t0, channel_by_instr, monophonic=not args.multi_voice)
+    if not args.no_program_change:
+        for instr in accomp_instrs:
+            midi_out.set_program(instr, instr)
 
     def on_played(onset_s, dur_s, role, pitch):
         # Only the companion's notes go to the output port -- you already
@@ -139,8 +142,8 @@ def main():
     rtf = total_music_s / total_wall_s if total_wall_s > 0 else float("inf")
     print(
         f"inference calls: {len(duet.gen_stats)}, "
-        f"music generated: {total_music_s:.1f}s in {total_wall_s:.1f}s wall time "
-        f"(realtime factor {rtf:.2f}x), underruns: {duet.underruns}"
+        f"music committed: {total_music_s:.1f}s in {total_wall_s:.1f}s wall time "
+        f"(committed-time throughput {rtf:.2f}x), underruns: {duet.underruns}, expired notes dropped: {duet.dropped_expired + midi_out.dropped_expired}"
     )
 
     if duet.history:

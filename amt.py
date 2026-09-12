@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from anticipation import ops
 from anticipation.sample import safe_logits, future_logits, nucleus
 from anticipation.config import TIME_RESOLUTION
-from anticipation.vocab import TIME_OFFSET, DUR_OFFSET, NOTE_OFFSET, MAX_NOTE, AUTOREGRESS
+from anticipation.vocab import TIME_OFFSET, DUR_OFFSET, NOTE_OFFSET, MAX_NOTE, MAX_DUR, AUTOREGRESS
 
 MELODY_INSTR = 0     # GM acoustic grand piano -- stands in for the live performer
 
@@ -40,7 +40,7 @@ ACCOMP_BIAS = 2.0
 
 def make_event(time_s, dur_s, instr, pitch):
     t = TIME_OFFSET + max(0, round(time_s * TIME_RESOLUTION))
-    d = DUR_OFFSET + max(1, round(dur_s * TIME_RESOLUTION))
+    d = DUR_OFFSET + min(MAX_DUR - 1, max(1, round(dur_s * TIME_RESOLUTION)))
     n = NOTE_OFFSET + instr * 128 + pitch
     return [t, d, n]
 
@@ -69,7 +69,19 @@ def _instr_mask_logits(logits, accomp_instrs, accomp_bias):
     return logits
 
 
-def _add_token(model, tokens, top_p, current_time, accomp_instrs, accomp_bias):
+def _cached_logits(model, prefix, cache):
+    """Reuse attention state only when every cached input token is unchanged."""
+    previous = cache.get("prefix", [])
+    reuse = previous and len(prefix) > len(previous) and prefix[:len(previous)] == previous
+    suffix = prefix[len(previous):] if reuse else prefix
+    input_tokens = torch.tensor([suffix], device=model.device)
+    output = model(input_tokens, past_key_values=cache.get("past") if reuse else None,
+                   use_cache=True)
+    cache.update(prefix=prefix.copy(), past=output.past_key_values)
+    return output.logits[0, -1]
+
+
+def _add_token(model, tokens, top_p, current_time, accomp_instrs, accomp_bias, cache=None):
     """anticipation.sample.add_token, plus the instrument mask above."""
     history = tokens.copy()
     lookback = max(len(tokens) - 1017, 0)
@@ -78,11 +90,13 @@ def _add_token(model, tokens, top_p, current_time, accomp_instrs, accomp_bias):
     history[::3] = [tok - offset for tok in history[::3]]
 
     new_token = []
-    with torch.no_grad():
+    cache = {} if cache is None else cache
+    with torch.inference_mode():
         for i in range(3):
-            input_tokens = torch.tensor([AUTOREGRESS] + history + new_token).unsqueeze(0).to(model.device)
-            logits = model(input_tokens).logits[0, -1]
-            idx = input_tokens.shape[1] - 1
+            prefix = [AUTOREGRESS] + history + new_token
+            # Sliding the context or rebasing timestamps resets cached attention.
+            logits = _cached_logits(model, prefix, cache)
+            idx = len(prefix) - 1
             logits = safe_logits(logits, idx)
             if i == 0:
                 logits = future_logits(logits, current_time - offset)
@@ -114,8 +128,9 @@ def generate_duet(model, start_time, end_time, inputs, accomp_instrs=STRING_ENSE
     tokens = ops.pad(ops.clip(inputs, 0, start_time, clip_duration=False, seconds=False), start_time)
     current_time = ops.max_time(tokens, seconds=False)
 
+    cache = {}
     while True:
-        new_token = _add_token(model, tokens, top_p, max(start_time, current_time), accomp_instrs, accomp_bias)
+        new_token = _add_token(model, tokens, top_p, max(start_time, current_time), accomp_instrs, accomp_bias, cache)
         new_time = new_token[0] - TIME_OFFSET
         if new_time >= end_time:
             break
