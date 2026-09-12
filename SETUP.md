@@ -14,6 +14,48 @@ pip install git+https://github.com/jthickstun/anticipation.git
 `python-rtmidi` is the part that actually talks to hardware -- `mido` alone
 can only read/write `.mid` files.
 
+## Non-live examples (no keyboard needed)
+
+`live_duet.py` runs the same `LiveDuet` scheduler against a synthetic melody
+instead of a real keyboard -- useful for trying the model, or a specific
+combination of flags, without any hardware. It downloads/loads the model, runs
+the performance in real time (so a 30-note melody still takes roughly as long
+to generate as it would to play), and writes the result to
+`output/live_duet.mid` -- drag that into a DAW to listen; nothing plays audio
+on its own.
+
+```bash
+# Default: string ensemble (violin/viola/cello), a 32-note major-key melody.
+python live_duet.py
+
+# A single instrument voice instead of the ensemble default.
+python live_duet.py --voices guitar
+
+# Let the companion overlap itself (a section, not a soloist).
+python live_duet.py --voices orchestral --multi-voice
+
+# Wilder, less predictable pitch/rhythm choices.
+python live_duet.py --temperature 1.3
+
+# Start playing immediately instead of listening for 8 beats first.
+python live_duet.py --role lead
+
+# A longer, minor-key melody at a different tempo.
+python live_duet.py --key A --mode minor --notes 48 --bpm 100
+
+# Combine several: sax lead, no listen-first wait, sharper/safer sampling.
+python live_duet.py --voices sax --role lead --temperature 0.7
+```
+
+`--seed` controls the synthetic melody itself (same seed -- same melody), so
+it's useful for comparing two flag combinations against identical input. See
+`python live_duet.py --help` for the full list, including `--accomp-bias`,
+`--lookahead-beats`, and `--commit-beats`.
+
+Also runnable via the local wrapper (`./run_local.sh --demo ...`, see below)
+or as a regression suite (`./run_local.sh --test`) -- both work without a
+model download after the first run.
+
 ## 2. Plug in your keyboard
 
 Any class-compliant USB-MIDI keyboard just works over USB. If yours only has

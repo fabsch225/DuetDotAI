@@ -41,50 +41,59 @@ def resolve_port(name, available, kind):
 
 
 class MidiKeyboardInput:
-    """Listens to a real MIDI input port on a background thread (mido's
-    callback runs on its own thread) and exposes completed notes as
-    (onset_s, dur_s, pitch), relative to a shared t0 -- the same shape and
-    the same wall clock as SyntheticMelodySource's precomputed list, so
-    LiveDuet can't tell the difference.
+    """Publish note attacks immediately, then revise their provisional durations.
 
-    A note only becomes visible once its note_off arrives, since its
-    duration isn't known before that -- there is an inherent reaction delay
-    equal to how long the player actually holds each note, before anything
-    the scheduler itself adds on top. This is a real, honest limitation of
-    modeling notes as (onset, duration) triples rather than separate
-    note-on/note-off events; see SETUP.md.
+    Each physical note has a stable id, including repeated pitches and different
+    MIDI channels. A held note is one updatable event, never a new note per poll.
+    Velocity is retained for downstream use; AMT's token format omits velocity.
+    Sustain CC is not modeled: final duration currently means key-down duration.
     """
 
     def __init__(self, port_name, t0):
         self.t0 = t0
         self._queue = queue.Queue()
-        self._open_notes = {}  # pitch -> onset_s
+        self._open_notes = {}
+        self._lock = threading.Lock()
+        self._next_id = 0
         self._port = mido.open_input(port_name, callback=self._on_message)
 
     def _on_message(self, msg):
         now = time.monotonic() - self.t0
-        if msg.type == "note_on" and msg.velocity > 0:
-            self._open_notes[msg.note] = now
-        elif msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0):
-            onset_s = self._open_notes.pop(msg.note, None)
-            if onset_s is not None:
-                self._queue.put((onset_s, max(now - onset_s, 0.02), msg.note))
+        with self._lock:
+            if msg.type == "note_on" and msg.velocity > 0:
+                key = (msg.channel, msg.note)
+                previous = self._open_notes.pop(key, None)
+                if previous is not None:
+                    self._finish(previous, now)
+                event = dict(id=self._next_id, onset=now, duration=0.1,
+                             pitch=msg.note, velocity=msg.velocity, complete=False)
+                self._next_id += 1
+                self._open_notes[key] = event
+                self._queue.put(event.copy())
+            elif msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0):
+                event = self._open_notes.pop((msg.channel, msg.note), None)
+                if event is not None:
+                    self._finish(event, now)
+
+    def _finish(self, event, now):
+        event = dict(event, duration=max(now - event["onset"], 0.02), complete=True)
+        self._queue.put(event)
 
     def poll(self, playhead):
-        """Return notes completed since the last call. `playhead` is
-        accepted (unused) only to match SyntheticMelodySource's interface --
-        completion, not a precomputed onset, is what gates visibility here."""
-        notes = []
-        while True:
-            try:
-                notes.append(self._queue.get_nowait())
-            except queue.Empty:
-                break
-        return notes
+        updates = {}
+        with self._lock:
+            while True:
+                try:
+                    event = self._queue.get_nowait()
+                    updates[event["id"]] = event
+                except queue.Empty:
+                    break
+            for event in self._open_notes.values():
+                updates[event["id"]] = dict(
+                    event, duration=max(0.1, playhead - event["onset"] + 0.1))
+        return list(updates.values())
 
     def exhausted(self):
-        """A live keyboard never runs out on its own; the session ends via
-        LiveDuet.request_stop() (see live_midi.py's Ctrl+C handler)."""
         return False
 
     def close(self):
@@ -92,59 +101,94 @@ class MidiKeyboardInput:
 
 
 class MidiPlayer:
-    """Schedules companion notes to a real MIDI output at the right
-    wall-clock time, relative to the same shared t0. Runs its own polling
-    thread so LiveDuet's main loop never blocks on hardware I/O.
+    """Play a bounded queue of notes; enforce monophony on the actual output.
 
-    Because commits happen ahead of when they're due (that's the whole
-    lookahead/commit buffer), most notes are scheduled here before their
-    onset and simply wait; a note whose onset has already passed by the
-    time it's scheduled (a genuine underrun) fires immediately instead of
-    being dropped, matching how underrun notes are still kept in the MIDI
-    export elsewhere in this bench.
+    Expired notes are discarded. Slightly late notes keep their original end
+    time. In monophonic mode, a new onset stops the previous channel voice,
+    including notes queued by an earlier generation window.
     """
 
-    def __init__(self, port_name, t0, channel_by_instr, poll_interval=0.005):
+    def __init__(self, port_name, t0, channel_by_instr, poll_interval=0.005,
+                 monophonic=True):
         self.t0 = t0
         self.channel_by_instr = channel_by_instr
+        self.monophonic = monophonic
         self._port = mido.open_output(port_name)
         self._lock = threading.Lock()
-        self._pending = []  # [onset_s, dur_s, pitch, channel, fired]
+        self._pending = []  # mutable [onset, duration, pitch, channel, fired]
+        self._active_counts = {}
+        self.dropped_expired = 0
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, args=(poll_interval,), daemon=True)
         self._thread.start()
 
     def set_program(self, instr, program):
-        self._port.send(mido.Message("program_change", channel=self.channel_by_instr[instr], program=program))
+        with self._lock:
+            self._port.send(mido.Message("program_change", channel=self.channel_by_instr[instr], program=program))
 
     def schedule(self, onset_s, dur_s, instr, pitch):
         channel = self.channel_by_instr[instr]
         with self._lock:
             self._pending.append([onset_s, dur_s, pitch, channel, False])
 
+    def _release(self, note):
+        key = (note[3], note[2])
+        remaining = self._active_counts.get(key, 1) - 1
+        if remaining <= 0:
+            self._active_counts.pop(key, None)
+            self._port.send(mido.Message("note_off", note=note[2], channel=note[3]))
+        else:
+            self._active_counts[key] = remaining
+
+    def _tick(self, now):
+        # Caller owns _lock. Sorting handles late arrivals and unordered batches.
+        ordered = sorted(self._pending, key=lambda n: n[0])
+        sounding = []
+        future = []
+        for note in ordered:
+            onset, duration, pitch, channel, fired = note
+            if now >= onset + duration:
+                if fired:
+                    self._release(note)
+                else:
+                    self.dropped_expired += 1
+            elif fired:
+                sounding.append(note)
+            else:
+                future.append(note)
+        waiting = []
+        for note in future:
+            onset, duration, pitch, channel, _ = note
+            if onset > now:
+                waiting.append(note)
+                continue
+            if self.monophonic:
+                keep = []
+                for previous in sounding:
+                    if previous[3] == channel:
+                        self._release(previous)
+                    else:
+                        keep.append(previous)
+                sounding = keep
+            self._port.send(mido.Message("note_on", note=pitch, velocity=80, channel=channel))
+            key = (channel, pitch)
+            self._active_counts[key] = self._active_counts.get(key, 0) + 1
+            note[4] = True
+            sounding.append(note)
+        self._pending = sounding + waiting
+
     def _run(self, poll_interval):
         while not self._stop.is_set():
-            now = time.monotonic() - self.t0
             with self._lock:
-                still_pending = []
-                for note in self._pending:
-                    onset_s, dur_s, pitch, channel, fired = note
-                    if not fired and now >= onset_s:
-                        self._port.send(mido.Message("note_on", note=pitch, velocity=80, channel=channel))
-                        note[4] = True
-                    if note[4] and now >= onset_s + dur_s:
-                        self._port.send(mido.Message("note_off", note=pitch, channel=channel))
-                    else:
-                        still_pending.append(note)
-                self._pending = still_pending
-            time.sleep(poll_interval)
+                self._tick(time.monotonic() - self.t0)
+            self._stop.wait(poll_interval)
 
     def close(self):
         self._stop.set()
         self._thread.join(timeout=1.0)
-        # silence anything still ringing before closing the port
         with self._lock:
-            for onset_s, dur_s, pitch, channel, fired in self._pending:
-                if fired:
-                    self._port.send(mido.Message("note_off", note=pitch, channel=channel))
+            for channel, pitch in self._active_counts:
+                self._port.send(mido.Message("note_off", note=pitch, channel=channel))
+            self._active_counts.clear()
+            self._pending.clear()
         self._port.close()
