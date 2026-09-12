@@ -72,6 +72,21 @@ INSTR_NAMES = {
 # enough to blow the scheduling buffer (near-100% underrun on one melody).
 MAX_GENERATION_ATTEMPTS = 2
 
+# Once the accompaniment has gone silent for a few windows in a row, it
+# tends to *stay* silent: with no precedent for that instrument anywhere in
+# the growing context, the model increasingly favors continuing that
+# absence, and retrying with the same stuck context (MAX_GENERATION_ATTEMPTS
+# above) doesn't help since nothing about the prompt has changed. Verified
+# directly against a real stuck context from an actual session that went
+# fully silent: accomp_bias=2.0 (the base default) failed 4/4 trials there;
+# 4.0-6.0 reliably broke the lock (1-8 notes/trial, never zero). Escalating
+# the bias after consecutive silent windows, and resetting the moment
+# something commits, targets exactly this lock-in without permanently
+# raising the bias (which would just make it a slower version of the same
+# non-monotonic problem noted above).
+SILENCE_BIAS_STEP = 1.5
+MAX_SILENCE_BIAS_STEPS = 4
+
 # amt._add_token already only looks at the model's own trailing ~1017-token
 # (~339-event) context window internally -- anything older is invisible to
 # it anyway. Without this, _maybe_kick_generation hands the model's
@@ -165,6 +180,7 @@ class LiveDuet:
 
         self.gen_stats = []          # (music_s_requested, wall_s_taken)
         self.underruns = 0
+        self._consecutive_silent = 0  # windows in a row that committed nothing; see SILENCE_BIAS_STEP
         # Normally set fresh in run(). Injectable so a caller (live_midi.py)
         # can open real MIDI ports against the exact same clock *before*
         # the blocking run() call starts -- there's no other way to hand
@@ -265,10 +281,14 @@ class LiveDuet:
         if window_start > 0:
             hist_snapshot = ops.translate(hist_snapshot, -window_start, seconds=True)
 
+        escalated_bias = self.accomp_bias + SILENCE_BIAS_STEP * min(
+            self._consecutive_silent, MAX_SILENCE_BIAS_STEPS,
+        )
+
         wall_start = time.monotonic()
         future = self.pool.submit(
             _generate_nonsilent, self.model, gen_start - window_start, gen_end - window_start,
-            commit_end - window_start, hist_snapshot, self.accomp_instrs, self.top_p, self.accomp_bias,
+            commit_end - window_start, hist_snapshot, self.accomp_instrs, self.top_p, escalated_bias,
             self.temperature,
         )
         self.pending = (future, gen_start, gen_end, wall_start, window_start)
@@ -303,12 +323,18 @@ class LiveDuet:
         self._commit_accompaniment(committed)
         self.committed_horizon = commit_end
 
+        if committed:
+            self._consecutive_silent = 0
+        else:
+            self._consecutive_silent += 1
+
         tag = "ok" if not late else f"UNDERRUN ({late} note(s) arrived after their cue)"
         self.underruns += 1 if late else 0
         retry_note = f", {attempts} attempt(s)" if attempts > 1 else ""
+        silent_note = f", {self._consecutive_silent} silent window(s) in a row" if self._consecutive_silent > 1 else ""
         self.log(
             f"model wrote [{gen_start:5.2f}s..{gen_end:5.2f}s) in {wall_dt:4.2f}s wall time{retry_note}, "
-            f"committed {len(committed)} note(s) up to {commit_end:5.2f}s -- {tag}"
+            f"committed {len(committed)} note(s) up to {commit_end:5.2f}s -- {tag}{silent_note}"
         )
 
     def _commit_accompaniment(self, notes):

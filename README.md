@@ -93,6 +93,25 @@ For an actual physical MIDI keyboard instead of the synthetic melody, see
 
 ## Findings
 
+- **A real live session went completely silent for its entire length --
+  root-caused and fixed.** Every single window committed 0 notes (both
+  retry attempts, every window, from the very first) in an actual session
+  with a musician playing real MIDI. Reproduced directly: took the exact
+  melody from that session's log and replayed it, first independently per
+  window (worked fine most of the time) then *sequentially* -- each window
+  building on the real (empty) accompaniment history left by the previous
+  one, matching what actually happened live -- and hit the same lock-in:
+  once a few windows in a row commit nothing, the model has no precedent
+  for that instrument anywhere in the growing context and increasingly
+  favors continuing its absence, so retrying with the same now-stuck
+  context (`MAX_GENERATION_ATTEMPTS`) doesn't help. Confirmed directly
+  against a stuck context pulled from that reproduction: `accomp_bias=2.0`
+  (the base default) failed 4/4 trials there; 4.0-6.0 reliably broke the
+  lock (1-8 notes/trial, never zero). Fixed by escalating the bias by
+  `SILENCE_BIAS_STEP` per consecutive silent window (capped at
+  `MAX_SILENCE_BIAS_STEPS`), resetting the moment something commits --
+  verified against the same stuck sequence: 3 silent windows in a row,
+  then broke through and never got stuck again.
 - **A broader instrument sweep (3 trials each, solo-masked against the same
   piano prompt) found several more usable voices beyond the string
   section:** electric piano (69 notes across 3 trials), nylon guitar (219 —
