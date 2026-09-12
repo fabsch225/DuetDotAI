@@ -14,14 +14,15 @@ package. Not on PyPI — install from GitHub (see below).
 
 - `melody.py` — a synthetic scale-constrained melody (built with `musicpy`),
   standing in for a live player.
-- `amt.py` — the model interface: event↔token encoding, and a logit mask
-  that restricts generation to melody (piano) plus a configurable set of
-  companion instruments, instead of letting a Lakh-trained checkpoint
-  free-associate across all 128. **Default is a string ensemble** (violin,
-  viola, cello); `--solo` drops down to one violin. Both were empirically
-  verified against a solo piano prompt, individually and — for the
-  ensemble — together (checking the three don't starve each other out);
-  see "Findings" below.
+- `amt.py` — the model interface: event↔token encoding, a logit mask that
+  restricts generation to melody (piano) plus a configurable set of
+  companion instruments (`INSTRUMENT_PRESETS` — see `--voices` below)
+  instead of letting a Lakh-trained checkpoint free-associate across all
+  128, and a `temperature` knob (scales raw logits before `top_p`
+  truncation) alongside the existing `accomp_bias`. **Default voices are a
+  string ensemble** (violin, viola, cello) — empirically verified against a
+  solo piano prompt, individually and together (checking the three don't
+  starve each other out); see "Findings" below.
 - `live_duet.py` — the scheduler. Runs a real wall-clock transport; the
   melody is only ever revealed up to the current playhead (no peeking at its
   own future), and a background thread continuously asks the model to write
@@ -54,19 +55,37 @@ package. Not on PyPI — install from GitHub (see below).
 pip install torch transformers musicpy
 pip install git+https://github.com/jthickstun/anticipation.git
 python live_duet.py --notes 32 --bpm 80 --lookahead-beats 2.5 --commit-beats 1.75
-python live_duet.py --notes 32 --bpm 80 --lookahead-beats 2.5 --commit-beats 1.75 --solo --multi-voice
+python live_duet.py --notes 32 --bpm 80 --voices sax --temperature 1.4 --role lead --multi-voice
 # writes output/live_duet.mid in this directory by default; override with --outdir
 ```
 
 Flags: `--bpm`, `--key`/`--mode`, `--notes` (melody length), `--seed`,
-`--lookahead-beats`, `--commit-beats`, `--listen-first-beats`, `--top-p`,
-`--accomp-bias` (logit bias toward the kept instrument(s) — free, since the
-alternative is always discarded anyway). Two independent, composable
-toggles: `--solo` picks *which* instrument(s) play (one violin, instead of
-the default string ensemble of violin/viola/cello) and `--multi-voice`
-picks *how many notes at once* a given instrument may play (one at a time,
-the default; or overlapping, a section rather than a soloist). All four
-combinations work.
+`--lookahead-beats`, `--commit-beats`, `--top-p`, `--accomp-bias` (logit
+bias toward the kept instrument(s) — free, since the alternative is always
+discarded anyway). Four independent, composable knobs:
+
+- `--voices {strings,violin,guitar,sax,brass,keys,orchestral,ambient}` —
+  *which* instrument(s) play (default `strings`: violin/viola/cello). All
+  eight are `amt.INSTRUMENT_PRESETS`, each empirically verified to produce
+  real output against a solo piano prompt (see "Findings").
+- `--multi-voice` — *how many notes at once* a given instrument may play:
+  one at a time (default) or overlapping, a section rather than a soloist.
+- `--temperature` (default 1.0) — how wild: scales the raw logits before
+  `top_p` truncation. Below 1.0 sharpens toward the model's most confident
+  guesses; above 1.0 flattens the distribution into wilder, less coherent
+  pitch/rhythm choices. Distinct from `--top-p` (how much of the
+  probability tail gets truncated) and `--accomp-bias` (a fixed preference
+  for *which* instrument, not how sharply any of them is sampled).
+- `--role {follow,lead}` (default `follow`) — `follow` waits through
+  `--listen-first-beats` (default 8) before playing, always reacting to
+  melody already heard; `lead` starts immediately
+  (`--listen-first-beats` defaults to 0). Both still only ever generate
+  from melody already revealed, so this doesn't reverse who the human/AI
+  parts are — it only changes whether the companion waits for a cue to
+  start. An explicit `--listen-first-beats` always overrides the role's
+  default.
+
+All flags compose freely.
 
 For an actual physical MIDI keyboard instead of the synthetic melody, see
 **SETUP.md** and run `live_midi.py` instead (same flags, plus `--midi-in`/
@@ -74,6 +93,37 @@ For an actual physical MIDI keyboard instead of the synthetic melody, see
 
 ## Findings
 
+- **A broader instrument sweep (3 trials each, solo-masked against the same
+  piano prompt) found several more usable voices beyond the string
+  section:** electric piano (69 notes across 3 trials), nylon guitar (219 —
+  by far the strongest single voice found), string-ensemble patch (43),
+  trumpet (47), alto sax (109), flute (20), new-age pad (25), harp (20).
+  `INSTRUMENT_PRESETS` (`--voices`) packages these into 8 named options —
+  a solo violin, the string trio, and five more solo/paired options — so a
+  caller doesn't need to know GM program numbers or which ones actually
+  produce output.
+- **Temperature is a real, distinct knob from `top_p`/`accomp_bias`,
+  verified not just plausible.** Scaling logits by `1/temperature` before
+  `top_p` truncation measurably changes both density and pitch spread on
+  the same prompt: temperature 0.6 produced 227 notes with pitch std 13.3
+  across 3 trials, 1.0 produced 30 notes with std 9.1, 1.6 produced only 10
+  notes but with std 19.3 (wider, more scattered pitch choices) — lower
+  temperature trends denser/safer, higher trends sparser/wilder, not a
+  placebo knob.
+- **"Follow vs. lead" is implemented honestly as what's actually
+  changeable, not a fake role reversal.** The model has no "leading" mode
+  and always generates from melody already revealed — there's no
+  architecture change that would let the companion take over the main
+  line without retraining. What's real and cheap: whether it waits through
+  `listen_first` before playing at all. `--role lead` sets that to 0 (starts
+  immediately) instead of the polite 8-beat default; verified the companion
+  actually starts within one commit cycle at t≈1s instead of waiting ~6s.
+  Genre control was considered and dropped: this checkpoint has no genre
+  conditioning signal at all (Lakh MIDI isn't cleanly genre-labeled for it),
+  so anything called "genre" would have to be a fake proxy (e.g. biasing
+  pitch range or density to loosely gesture at a style) — that's decorative,
+  not a real feature, and out of scope without fine-tuning (which
+  `proposal.md` already flags as the highest-risk, lowest-return item here).
 - **Live (unbounded) sessions had an unbounded performance regression --
   found while building `live_midi.py`, fixed.** `_maybe_kick_generation`
   handed the model's preprocessing (`ops.sort`/`clip`/`pad`, all O(history

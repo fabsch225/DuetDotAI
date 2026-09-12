@@ -27,7 +27,23 @@ MELODY_INSTR = 0     # GM acoustic grand piano -- stands in for the live perform
 # was consistently too sparse against a real, densely-played performance to
 # be heard at all (see SETUP.md).
 SOLO_ACCOMP_INSTRS = (40,)                    # one violin
-STRING_ENSEMBLE_ACCOMP_INSTRS = (40, 41, 42)  # violin, viola, cello
+STRING_ENSEMBLE_ACCOMP_INSTRS = (40, 41, 42)  # violin, viola, cello -- the default
+
+# A broader sweep (each candidate solo-masked, 3 trials, against the same
+# 8-beat piano prompt): electric piano 69 notes/3 trials, nylon guitar 219(!),
+# string-ensemble patch 43, trumpet 47, alto sax 109, flute 20, new-age pad
+# 25, harp 20 -- all real, usable output, not guessed. Named so a caller
+# doesn't need to know GM program numbers.
+INSTRUMENT_PRESETS = {
+    "strings": STRING_ENSEMBLE_ACCOMP_INSTRS,  # violin, viola, cello
+    "violin": SOLO_ACCOMP_INSTRS,
+    "guitar": (24,),        # nylon guitar -- the strongest single voice found
+    "sax": (65,),           # alto sax
+    "brass": (56,),         # trumpet
+    "keys": (4,),           # electric piano
+    "orchestral": (48, 46),  # string-ensemble patch + harp
+    "ambient": (88, 73),    # new-age pad + flute
+}
 
 # Even restricted to a small instrument set, the model is free to spend an
 # entire window "predicting" more piano (the ReaLJam-style trick of jointly
@@ -69,7 +85,7 @@ def _instr_mask_logits(logits, accomp_instrs, accomp_bias):
     return logits
 
 
-def _add_token(model, tokens, top_p, current_time, accomp_instrs, accomp_bias):
+def _add_token(model, tokens, top_p, temperature, current_time, accomp_instrs, accomp_bias):
     """anticipation.sample.add_token, plus the instrument mask above."""
     history = tokens.copy()
     lookback = max(len(tokens) - 1017, 0)
@@ -81,7 +97,7 @@ def _add_token(model, tokens, top_p, current_time, accomp_instrs, accomp_bias):
     with torch.no_grad():
         for i in range(3):
             input_tokens = torch.tensor([AUTOREGRESS] + history + new_token).unsqueeze(0).to(model.device)
-            logits = model(input_tokens).logits[0, -1]
+            logits = model(input_tokens).logits[0, -1] / temperature
             idx = input_tokens.shape[1] - 1
             logits = safe_logits(logits, idx)
             if i == 0:
@@ -98,14 +114,21 @@ def _add_token(model, tokens, top_p, current_time, accomp_instrs, accomp_bias):
 
 
 def generate_duet(model, start_time, end_time, inputs, accomp_instrs=STRING_ENSEMBLE_ACCOMP_INSTRS,
-                   top_p=1.0, accomp_bias=ACCOMP_BIAS):
+                   top_p=1.0, accomp_bias=ACCOMP_BIAS, temperature=1.0):
     """
     anticipation.sample.generate_ar, restricted to melody + a chosen set of
     accompaniment instruments.
 
     Jointly continues both the melody instrument (discarded by the caller)
     and the accompaniment instrument(s) (kept) from start_time to end_time,
-    given the prior events in `inputs`.
+    given the prior events in `inputs`. `temperature` scales the raw logits
+    before top_p truncation -- below 1.0 sharpens the distribution toward
+    the model's most confident guesses (more conservative/predictable),
+    above 1.0 flattens it (wilder, more surprising choices of pitch,
+    duration, and timing alike, since all three are sampled through this
+    same path). Distinct from top_p (nucleus truncation of the tail) and
+    accomp_bias (a fixed preference for which instrument, not how sharply
+    any of them is sampled).
     """
     start_time = int(TIME_RESOLUTION * start_time)
     end_time = int(TIME_RESOLUTION * end_time)
@@ -115,7 +138,8 @@ def generate_duet(model, start_time, end_time, inputs, accomp_instrs=STRING_ENSE
     current_time = ops.max_time(tokens, seconds=False)
 
     while True:
-        new_token = _add_token(model, tokens, top_p, max(start_time, current_time), accomp_instrs, accomp_bias)
+        new_token = _add_token(model, tokens, top_p, temperature, max(start_time, current_time),
+                                accomp_instrs, accomp_bias)
         new_time = new_token[0] - TIME_OFFSET
         if new_time >= end_time:
             break

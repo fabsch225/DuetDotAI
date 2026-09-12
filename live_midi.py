@@ -25,7 +25,7 @@ from transformers import AutoModelForCausalLM
 from anticipation import ops
 from anticipation.convert import events_to_midi
 
-from amt import MELODY_INSTR, SOLO_ACCOMP_INSTRS, STRING_ENSEMBLE_ACCOMP_INSTRS, ACCOMP_BIAS, generate_duet
+from amt import MELODY_INSTR, INSTRUMENT_PRESETS, ACCOMP_BIAS, generate_duet
 from live_duet import LiveDuet, INSTR_NAMES
 import midi_io
 
@@ -41,11 +41,19 @@ def main():
                           "line up with what you're actually playing")
     ap.add_argument("--lookahead-beats", type=float, default=2.5)
     ap.add_argument("--commit-beats", type=float, default=1.75)
-    ap.add_argument("--listen-first-beats", type=float, default=8.0)
+    ap.add_argument("--listen-first-beats", type=float, default=None,
+                     help="beats of silence before the companion plays its first note "
+                          "(default: 8 for --role follow, 0 for --role lead)")
     ap.add_argument("--top-p", type=float, default=0.95)
+    ap.add_argument("--temperature", type=float, default=1.0,
+                     help="how wild the companion should be -- see live_duet.py --help")
     ap.add_argument("--accomp-bias", type=float, default=ACCOMP_BIAS)
-    ap.add_argument("--solo", action="store_true", help="one violin instead of the default string ensemble (violin, viola, cello)")
+    ap.add_argument("--voices", choices=sorted(INSTRUMENT_PRESETS), default="strings",
+                     help="which instrument(s) play the companion part (default: strings)")
     ap.add_argument("--multi-voice", action="store_true", help="let each instrument overlap itself")
+    ap.add_argument("--role", choices=["follow", "lead"], default="follow",
+                     help="follow (default): wait through --listen-first-beats, always "
+                          "reacting to what's already been played. lead: start immediately")
     ap.add_argument("--outdir", default=str(Path(__file__).resolve().parent / "output"))
     args = ap.parse_args()
 
@@ -68,7 +76,11 @@ def main():
     midi_in_name = midi_io.resolve_port(args.midi_in, ports["inputs"], "input")
     midi_out_name = midi_io.resolve_port(args.midi_out, ports["outputs"], "output")
 
-    accomp_instrs = SOLO_ACCOMP_INSTRS if args.solo else STRING_ENSEMBLE_ACCOMP_INSTRS
+    accomp_instrs = INSTRUMENT_PRESETS[args.voices]
+    listen_first_beats = args.listen_first_beats
+    if listen_first_beats is None:
+        listen_first_beats = 0.0 if args.role == "lead" else 8.0
+
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -79,7 +91,7 @@ def main():
 
     print("soundcheck: warming up the model (not part of the timed session) ...")
     warm_start = time.monotonic()
-    generate_duet(model, 0.0, 60.0 / args.bpm, [], accomp_instrs, args.top_p, args.accomp_bias)
+    generate_duet(model, 0.0, 60.0 / args.bpm, [], accomp_instrs, args.top_p, args.accomp_bias, args.temperature)
     print(f"soundcheck done in {time.monotonic() - warm_start:.2f}s")
 
     # Shared clock: opened before the blocking duet.run() call so the MIDI
@@ -106,10 +118,11 @@ def main():
         bpm=args.bpm,
         lookahead_beats=args.lookahead_beats,
         commit_beats=args.commit_beats,
-        listen_first_beats=args.listen_first_beats,
+        listen_first_beats=listen_first_beats,
         top_p=args.top_p,
         accomp_instrs=accomp_instrs,
         accomp_bias=args.accomp_bias,
+        temperature=args.temperature,
         polyphonic=args.multi_voice,
         on_played=on_played,
         t0=t0,
@@ -122,10 +135,13 @@ def main():
     signal.signal(signal.SIGINT, handle_sigint)
 
     voices = ", ".join(INSTR_NAMES.get(i, str(i)) for i in accomp_instrs)
-    voicing = "polyphonic (multiple violins)" if args.multi_voice else "monophonic (one violin)"
-    print(f"companion voice(s): {voices} -- {voicing}")
+    voicing = "polyphonic" if args.multi_voice else "monophonic"
+    print(f"companion voice(s): {voices} ({args.voices}) -- {voicing}, temperature={args.temperature}")
     print(f"listening on '{midi_in_name}', playing to '{midi_out_name}'")
-    print(f"quiet for the first {args.listen_first_beats} beats while it listens -- play now. Ctrl+C to stop.")
+    if listen_first_beats > 0:
+        print(f"quiet for the first {listen_first_beats} beats while it listens -- play now. Ctrl+C to stop.")
+    else:
+        print("leading -- it starts immediately, no need to play first. Ctrl+C to stop.")
 
     try:
         duet.run()

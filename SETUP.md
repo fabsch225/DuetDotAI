@@ -65,15 +65,19 @@ python live_midi.py --midi-in "Your Keyboard" --midi-out "IAC Driver Bus 1"
 
 The default companion is a string ensemble (violin, viola, cello) -- a lone
 violin was consistently too quiet to hear against a real performance. Add
-`--solo` to drop back to one violin, and/or `--multi-voice` to let a given
-instrument overlap itself (a section instead of a soloist) -- same two
-independent flags as `live_duet.py`.
+`--voices violin` to drop back to one violin (or `guitar`/`sax`/`brass`/
+`keys`/`orchestral`/`ambient` for a different companion voice entirely),
+`--multi-voice` to let a given instrument overlap itself (a section instead
+of a soloist), `--temperature` to control how wild it sounds, and/or
+`--role lead` to have it start playing immediately instead of waiting for
+you first -- same flags as `live_duet.py`, see its `--help`/README for
+details on each.
 
 It loads the model, does a brief silent soundcheck, then prints something
 like:
 
 ```
-companion voice(s): violin, viola, cello -- monophonic (one violin)
+companion voice(s): violin, viola, cello (strings) -- monophonic, temperature=1.0
 listening on 'Your Keyboard', playing to 'IAC Driver Bus 1'
 quiet for the first 8.0 beats while it listens -- play now. Ctrl+C to stop.
 ```
@@ -116,14 +120,16 @@ synthetic demo.
   MIDI Studio window, which shows connected devices). USB-MIDI should be
   plug-and-play on macOS; if it's not appearing, it's a cable/driver
   problem, not this script.
-- **I hear nothing from the companion.** Check, in order: the output
-  port name is exactly right (copy-paste from `--list-ports`, don't
-  retype it); the GarageBand track's input is actually set to that IAC bus;
+- **I hear nothing from the companion.** Check, in order: `--midi-out`
+  matches only the port you intend (an ASCII-safe substring like
+  "GarageBand" is fine and often more reliable than the full name -- see
+  above); the GarageBand track's input is actually set to that IAC bus;
   the track actually has an instrument loaded (see step 3); the track
   isn't muted and no other track has Solo engaged.
 - **It feels unresponsive / laggy.** Check the console log for `UNDERRUN`
   lines -- that means the model isn't keeping up with the buffer on your
   hardware. Try `--lookahead-beats 2 --commit-beats 1.5` (smaller windows,
-  less to compute per cycle), a slower `--bpm`, or `--solo` -- the default
-  3-instrument ensemble is a harder generation problem than one violin and
+  less to compute per cycle), a slower `--bpm`, or `--voices violin` -- the
+  default 3-instrument ensemble is a harder generation problem than one
+  voice and
   measurably more underrun-prone (realtime factor ~0.6-1.0x vs. 2-4x solo).

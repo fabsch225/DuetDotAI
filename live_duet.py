@@ -47,13 +47,17 @@ from anticipation.convert import events_to_midi
 from anticipation.vocab import DUR_OFFSET
 
 from amt import (
-    MELODY_INSTR, SOLO_ACCOMP_INSTRS, STRING_ENSEMBLE_ACCOMP_INSTRS, ACCOMP_BIAS,
+    MELODY_INSTR, STRING_ENSEMBLE_ACCOMP_INSTRS, INSTRUMENT_PRESETS, ACCOMP_BIAS,
     make_event, parse_events, generate_duet,
 )
 from melody import make_synthetic_melody
 
-# Names for the log, covering just the instruments amt.py actually offers.
-INSTR_NAMES = {40: "violin", 41: "viola", 42: "cello"}
+# Names for the log, covering every instrument INSTRUMENT_PRESETS offers.
+INSTR_NAMES = {
+    40: "violin", 41: "viola", 42: "cello", 24: "guitar", 65: "sax",
+    56: "trumpet", 4: "keys", 48: "string-ensemble", 46: "harp",
+    88: "pad", 73: "flute",
+}
 
 # Writing zero accompaniment notes in a window is a legitimate sample (the
 # model is free to spend the whole window "predicting" more piano), but a
@@ -82,11 +86,12 @@ MAX_GENERATION_ATTEMPTS = 2
 HISTORY_LOOKBACK_S = 90.0
 
 
-def _generate_nonsilent(model, gen_start, gen_end, commit_end, inputs, accomp_instrs, top_p, accomp_bias):
+def _generate_nonsilent(model, gen_start, gen_end, commit_end, inputs, accomp_instrs, top_p,
+                         accomp_bias, temperature):
     """generate_duet, retried up to MAX_GENERATION_ATTEMPTS times if the
     commit window comes back with no accompaniment notes at all."""
     for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
-        result = generate_duet(model, gen_start, gen_end, inputs, accomp_instrs, top_p, accomp_bias)
+        result = generate_duet(model, gen_start, gen_end, inputs, accomp_instrs, top_p, accomp_bias, temperature)
         has_note = any(
             instr in accomp_instrs and gen_start < t <= commit_end
             for t, _, instr, _ in parse_events(result)
@@ -132,7 +137,7 @@ class LiveDuet:
 
     def __init__(self, model, melody_source, melody_len_s, bpm, lookahead_beats,
                  commit_beats, listen_first_beats, top_p, accomp_instrs=STRING_ENSEMBLE_ACCOMP_INSTRS,
-                 accomp_bias=ACCOMP_BIAS, polyphonic=False, on_played=None, t0=None,
+                 accomp_bias=ACCOMP_BIAS, temperature=1.0, polyphonic=False, on_played=None, t0=None,
                  poll_interval=0.05):
         self.model = model
         self.melody_source = melody_source
@@ -144,6 +149,7 @@ class LiveDuet:
         self.top_p = top_p
         self.accomp_instrs = accomp_instrs
         self.accomp_bias = accomp_bias
+        self.temperature = temperature
         self.polyphonic = polyphonic
         self.on_played = on_played or (lambda onset_s, dur_s, role, pitch: None)
         self.poll_interval = poll_interval
@@ -263,6 +269,7 @@ class LiveDuet:
         future = self.pool.submit(
             _generate_nonsilent, self.model, gen_start - window_start, gen_end - window_start,
             commit_end - window_start, hist_snapshot, self.accomp_instrs, self.top_p, self.accomp_bias,
+            self.temperature,
         )
         self.pending = (future, gen_start, gen_end, wall_start, window_start)
 
@@ -368,26 +375,44 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--lookahead-beats", type=float, default=3.0)
     ap.add_argument("--commit-beats", type=float, default=1.5)
-    ap.add_argument("--listen-first-beats", type=float, default=8.0)
+    ap.add_argument("--listen-first-beats", type=float, default=None,
+                     help="beats of silence before the companion plays its first note "
+                          "(default: 8 for --role follow, 0 for --role lead)")
     ap.add_argument("--top-p", type=float, default=0.95)
+    ap.add_argument("--temperature", type=float, default=1.0,
+                     help="how wild the companion should be: scales the model's raw logits "
+                          "before sampling. Below 1.0 sharpens toward its most confident "
+                          "guesses (safer, more predictable); above 1.0 flattens the "
+                          "distribution (wilder pitch/rhythm choices, less coherent). "
+                          "Distinct from --top-p (how much of the tail gets truncated) and "
+                          "--accomp-bias (a fixed preference for which instrument)")
     ap.add_argument("--accomp-bias", type=float, default=ACCOMP_BIAS,
                      help="logit bias favoring the accompaniment instrument(s) over the "
                           "hallucinated-melody instrument (no coherence cost since the "
                           "latter is always discarded)")
-    ap.add_argument("--solo", action="store_true",
-                     help="one violin instead of the default string ensemble (violin, viola, "
-                          "cello) -- a lone violin was consistently too sparse against a real "
-                          "performance to be heard; which instrument(s) play, orthogonal to "
-                          "--multi-voice below")
+    ap.add_argument("--voices", choices=sorted(INSTRUMENT_PRESETS), default="strings",
+                     help="which instrument(s) play the companion part (default: strings -- "
+                          "violin/viola/cello; a lone violin was consistently too sparse "
+                          "against a real performance to be heard). Orthogonal to --multi-voice.")
     ap.add_argument("--multi-voice", action="store_true",
                      help="let each companion instrument overlap itself (a section, not a "
                           "soloist) instead of enforcing one note at a time per instrument -- "
                           "how many notes a given instrument can play at once, orthogonal to "
-                          "--solo above")
+                          "--voices above")
+    ap.add_argument("--role", choices=["follow", "lead"], default="follow",
+                     help="follow (default): wait through --listen-first-beats before playing "
+                          "a note, always reacting to melody that's already been heard. lead: "
+                          "start immediately (--listen-first-beats defaults to 0) instead of "
+                          "waiting to hear you first. Both still only ever generate from melody "
+                          "already revealed -- this doesn't reverse who the human/AI parts are, "
+                          "just whether the companion waits for a cue to start")
     ap.add_argument("--outdir", default=str(Path(__file__).resolve().parent / "output"))
     args = ap.parse_args()
 
-    accomp_instrs = SOLO_ACCOMP_INSTRS if args.solo else STRING_ENSEMBLE_ACCOMP_INSTRS
+    accomp_instrs = INSTRUMENT_PRESETS[args.voices]
+    listen_first_beats = args.listen_first_beats
+    if listen_first_beats is None:
+        listen_first_beats = 0.0 if args.role == "lead" else 8.0
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -404,10 +429,10 @@ def main():
     print(f"synthetic melody: {len(melody)} notes, {melody_len_s:.1f}s @ {args.bpm} bpm "
           f"({args.key} {args.mode}, seed={args.seed})")
     print(f"scheduler: lookahead={args.lookahead_beats} beats, commit={args.commit_beats} beats, "
-          f"listen_first={args.listen_first_beats} beats")
+          f"listen_first={listen_first_beats} beats, role={args.role}")
     voices = ", ".join(INSTR_NAMES.get(i, str(i)) for i in accomp_instrs)
-    voicing = "polyphonic (multiple violins)" if args.multi_voice else "monophonic (one violin)"
-    print(f"companion voice(s): {voices} -- {voicing}")
+    voicing = "polyphonic" if args.multi_voice else "monophonic"
+    print(f"companion voice(s): {voices} ({args.voices}) -- {voicing}, temperature={args.temperature}")
 
     # A real product warms up its model before the audience arrives, not
     # during the performance -- the first MPS/CUDA call always eats a large,
@@ -417,7 +442,7 @@ def main():
     warm_start = time.monotonic()
     dummy = [t for onset, dur, pitch in melody[:6] for t in make_event(onset, dur, MELODY_INSTR, pitch)]
     generate_duet(model, melody[5][0] + melody[5][1], melody[5][0] + melody[5][1] + beat_s,
-                  dummy, accomp_instrs, args.top_p, args.accomp_bias)
+                  dummy, accomp_instrs, args.top_p, args.accomp_bias, args.temperature)
     print(f"soundcheck done in {time.monotonic() - warm_start:.2f}s")
 
     print("--- live performance starts now (real wall-clock time) ---")
@@ -429,10 +454,11 @@ def main():
         bpm=args.bpm,
         lookahead_beats=args.lookahead_beats,
         commit_beats=args.commit_beats,
-        listen_first_beats=args.listen_first_beats,
+        listen_first_beats=listen_first_beats,
         top_p=args.top_p,
         accomp_instrs=accomp_instrs,
         accomp_bias=args.accomp_bias,
+        temperature=args.temperature,
         polyphonic=args.multi_voice,
     )
     duet.run()
