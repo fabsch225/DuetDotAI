@@ -17,11 +17,17 @@ MELODY_INSTR = 0     # GM acoustic grand piano -- stands in for the live perform
 
 # Companion voice(s). A sweep of candidate GM instruments against a solo
 # piano prompt found wildly different note yields (violin ~40+ notes per
-# window, acoustic bass ~0) -- these two are the ones actually confirmed to
+# window, acoustic bass ~0) -- these are the ones actually confirmed to
 # produce substantial output with this model and melody, not just an
-# idiomatically plausible pairing.
-SOLO_ACCOMP_INSTRS = (40,)         # one violin
-ENSEMBLE_ACCOMP_INSTRS = (40, 25)  # violin + steel guitar
+# idiomatically plausible pairing. Verified as an ensemble too (all three
+# masked in together, not just individually): violin/viola/cello each
+# actually got used across repeated trials, combined density 7-80 notes per
+# 4-beat window depending on sampling luck -- not one voice starving out
+# the others. STRING_ENSEMBLE_ACCOMP_INSTRS is the default: a lone violin
+# was consistently too sparse against a real, densely-played performance to
+# be heard at all (see SETUP.md).
+SOLO_ACCOMP_INSTRS = (40,)                    # one violin
+STRING_ENSEMBLE_ACCOMP_INSTRS = (40, 41, 42)  # violin, viola, cello
 
 # Even restricted to a small instrument set, the model is free to spend an
 # entire window "predicting" more piano (the ReaLJam-style trick of jointly
@@ -91,7 +97,7 @@ def _add_token(model, tokens, top_p, current_time, accomp_instrs, accomp_bias):
     return new_token
 
 
-def generate_duet(model, start_time, end_time, inputs, accomp_instrs=SOLO_ACCOMP_INSTRS,
+def generate_duet(model, start_time, end_time, inputs, accomp_instrs=STRING_ENSEMBLE_ACCOMP_INSTRS,
                    top_p=1.0, accomp_bias=ACCOMP_BIAS):
     """
     anticipation.sample.generate_ar, restricted to melody + a chosen set of

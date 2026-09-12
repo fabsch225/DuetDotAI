@@ -63,15 +63,17 @@ tool doesn't echo your own notes back out anywhere, only the companion's.
 python live_midi.py --midi-in "Your Keyboard" --midi-out "IAC Driver Bus 1"
 ```
 
-Add `--ensemble` for violin + steel guitar instead of solo violin, and/or
-`--multi-voice` to let a given instrument overlap itself (a section instead
-of a soloist) -- same two independent flags as `live_duet.py`.
+The default companion is a string ensemble (violin, viola, cello) -- a lone
+violin was consistently too quiet to hear against a real performance. Add
+`--solo` to drop back to one violin, and/or `--multi-voice` to let a given
+instrument overlap itself (a section instead of a soloist) -- same two
+independent flags as `live_duet.py`.
 
 It loads the model, does a brief silent soundcheck, then prints something
 like:
 
 ```
-companion voice(s): violin -- monophonic (one violin)
+companion voice(s): violin, viola, cello -- monophonic (one violin)
 listening on 'Your Keyboard', playing to 'IAC Driver Bus 1'
 quiet for the first 8.0 beats while it listens -- play now. Ctrl+C to stop.
 ```
@@ -122,4 +124,6 @@ synthetic demo.
 - **It feels unresponsive / laggy.** Check the console log for `UNDERRUN`
   lines -- that means the model isn't keeping up with the buffer on your
   hardware. Try `--lookahead-beats 2 --commit-beats 1.5` (smaller windows,
-  less to compute per cycle) or a slower `--bpm`.
+  less to compute per cycle), a slower `--bpm`, or `--solo` -- the default
+  3-instrument ensemble is a harder generation problem than one violin and
+  measurably more underrun-prone (realtime factor ~0.6-1.0x vs. 2-4x solo).

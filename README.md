@@ -17,11 +17,11 @@ package. Not on PyPI — install from GitHub (see below).
 - `amt.py` — the model interface: event↔token encoding, and a logit mask
   that restricts generation to melody (piano) plus a configurable set of
   companion instruments, instead of letting a Lakh-trained checkpoint
-  free-associate across all 128. Solo mode is one violin; `--ensemble` adds
-  a steel guitar as a second, independent voice. Both were chosen
-  empirically — they're the instruments this checkpoint actually writes
-  substantial output for against a solo piano prompt; see "Findings" below
-  for the selection sweep.
+  free-associate across all 128. **Default is a string ensemble** (violin,
+  viola, cello); `--solo` drops down to one violin. Both were empirically
+  verified against a solo piano prompt, individually and — for the
+  ensemble — together (checking the three don't starve each other out);
+  see "Findings" below.
 - `live_duet.py` — the scheduler. Runs a real wall-clock transport; the
   melody is only ever revealed up to the current playhead (no peeking at its
   own future), and a background thread continuously asks the model to write
@@ -54,7 +54,7 @@ package. Not on PyPI — install from GitHub (see below).
 pip install torch transformers musicpy
 pip install git+https://github.com/jthickstun/anticipation.git
 python live_duet.py --notes 32 --bpm 80 --lookahead-beats 2.5 --commit-beats 1.75
-python live_duet.py --notes 32 --bpm 80 --lookahead-beats 2.5 --commit-beats 1.75 --ensemble --multi-voice
+python live_duet.py --notes 32 --bpm 80 --lookahead-beats 2.5 --commit-beats 1.75 --solo --multi-voice
 # writes output/live_duet.mid in this directory by default; override with --outdir
 ```
 
@@ -62,10 +62,11 @@ Flags: `--bpm`, `--key`/`--mode`, `--notes` (melody length), `--seed`,
 `--lookahead-beats`, `--commit-beats`, `--listen-first-beats`, `--top-p`,
 `--accomp-bias` (logit bias toward the kept instrument(s) — free, since the
 alternative is always discarded anyway). Two independent, composable
-toggles: `--ensemble` picks *which* instrument(s) play (violin alone, or
-violin + steel guitar) and `--multi-voice` picks *how many notes at once* a
-given instrument may play (one at a time, "one violin", the default; or
-overlapping, "multiple violins", a section). All four combinations work.
+toggles: `--solo` picks *which* instrument(s) play (one violin, instead of
+the default string ensemble of violin/viola/cello) and `--multi-voice`
+picks *how many notes at once* a given instrument may play (one at a time,
+the default; or overlapping, a section rather than a soloist). All four
+combinations work.
 
 For an actual physical MIDI keyboard instead of the synthetic melody, see
 **SETUP.md** and run `live_midi.py` instead (same flags, plus `--midi-in`/
@@ -139,19 +140,39 @@ For an actual physical MIDI keyboard instead of the synthetic melody, see
   typical at 2 attempts) — silence-avoidance and real-time viability trade
   directly against each other on this hardware, they don't come for free
   together.
-- **Instrument pairing is not arbitrary.** A sweep over candidate GM
-  accompaniment instruments against the same piano prompt found wildly
-  different note yields (e.g. violin ≈40+ notes per window vs. bass ≈0) —
-  worth re-sweeping per melody instrument if this becomes a real engine.
-  `--ensemble` (violin + steel guitar) uses the two instruments actually
-  confirmed by that sweep; an idiomatically nicer string-section pairing
-  (e.g. viola/cello) was not swept and may turn out silent.
+- **Instrument pairing is not arbitrary, but a proper string section does
+  work.** A sweep over candidate GM instruments against the same piano
+  prompt found wildly different note yields (e.g. violin ≈40+ notes per
+  window vs. bass ≈0). Viola and cello were flagged as unverified in an
+  earlier pass; checked directly (solo-masked individually, then all three
+  masked in together as a real ensemble) and both produce real output --
+  individually 8-63 notes per 4-beat window across trials, and together
+  (violin/viola/cello all competing for probability mass under one mask)
+  7-80 notes total per window with no voice starving the others out. This
+  is now the default (`STRING_ENSEMBLE_ACCOMP_INSTRS`); `--solo` drops back
+  to one violin.
+- **A lone violin was consistently too sparse to hear against a real
+  performance.** In an actual session with a musician playing densely
+  (chords, continuous notes), one excerpt had ~150 human notes against only
+  16 companion notes in the same span, and half of *those* were trimmed to
+  under 150ms by the monophony logic (see below) -- audible as clicks at
+  best. The 3-voice ensemble is the fix: more total companion notes, and
+  since each instrument is independently monophonic, the ensemble's
+  *combined* texture can still be `--multi-voice`-off (each individual
+  voice clean) while having far more presence than one voice alone.
+- **The ensemble costs more compute than solo, and it shows.** Three
+  instruments competing for probability mass under one mask is a harder
+  generation problem than one -- realtime factor dropped to ~0.6-1.0x with
+  the default CLI settings (`--lookahead-beats 3 --commit-beats 1.5`),
+  down from the 2-4x solo saw. Worth tuning lookahead/commit down (or
+  raising them for more buffer cushion) per your hardware if you see
+  underruns; not yet retuned after this change.
 - **Monophony is a choice, not a constraint of the model.** `--multi-voice`
   simply skips the trim/dedup step at commit time — same generated notes,
   just not forced into a single line. Verified on one run: 34 violin notes
   / 0 self-overlaps with the default, vs. 43 violin notes / 32 self-overlaps
-  with `--multi-voice` on the same melody/seed. Composes cleanly with
-  `--ensemble` too (each instrument's polyphony is independent).
+  with `--multi-voice` on the same melody/seed. Composes cleanly with the
+  string ensemble too (each instrument's polyphony is independent).
 - **It doesn't just double the melody.** Checked one run's committed notes:
   41 accompaniment vs. 32 melody notes, only 1/41 at the exact same pitch,
   4/41 sharing a pitch class (unison/octave), and a pitch range (48-90)

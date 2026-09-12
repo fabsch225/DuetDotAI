@@ -25,7 +25,7 @@ from transformers import AutoModelForCausalLM
 from anticipation import ops
 from anticipation.convert import events_to_midi
 
-from amt import MELODY_INSTR, SOLO_ACCOMP_INSTRS, ENSEMBLE_ACCOMP_INSTRS, ACCOMP_BIAS, generate_duet
+from amt import MELODY_INSTR, SOLO_ACCOMP_INSTRS, STRING_ENSEMBLE_ACCOMP_INSTRS, ACCOMP_BIAS, generate_duet
 from live_duet import LiveDuet, INSTR_NAMES
 import midi_io
 
@@ -44,7 +44,7 @@ def main():
     ap.add_argument("--listen-first-beats", type=float, default=8.0)
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--accomp-bias", type=float, default=ACCOMP_BIAS)
-    ap.add_argument("--ensemble", action="store_true", help="violin + steel guitar instead of solo violin")
+    ap.add_argument("--solo", action="store_true", help="one violin instead of the default string ensemble (violin, viola, cello)")
     ap.add_argument("--multi-voice", action="store_true", help="let each instrument overlap itself")
     ap.add_argument("--outdir", default=str(Path(__file__).resolve().parent / "output"))
     args = ap.parse_args()
@@ -68,7 +68,7 @@ def main():
     midi_in_name = midi_io.resolve_port(args.midi_in, ports["inputs"], "input")
     midi_out_name = midi_io.resolve_port(args.midi_out, ports["outputs"], "output")
 
-    accomp_instrs = ENSEMBLE_ACCOMP_INSTRS if args.ensemble else SOLO_ACCOMP_INSTRS
+    accomp_instrs = SOLO_ACCOMP_INSTRS if args.solo else STRING_ENSEMBLE_ACCOMP_INSTRS
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 

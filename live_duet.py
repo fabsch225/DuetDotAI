@@ -47,13 +47,13 @@ from anticipation.convert import events_to_midi
 from anticipation.vocab import DUR_OFFSET
 
 from amt import (
-    MELODY_INSTR, SOLO_ACCOMP_INSTRS, ENSEMBLE_ACCOMP_INSTRS, ACCOMP_BIAS,
+    MELODY_INSTR, SOLO_ACCOMP_INSTRS, STRING_ENSEMBLE_ACCOMP_INSTRS, ACCOMP_BIAS,
     make_event, parse_events, generate_duet,
 )
 from melody import make_synthetic_melody
 
 # Names for the log, covering just the instruments amt.py actually offers.
-INSTR_NAMES = {40: "violin", 25: "guitar"}
+INSTR_NAMES = {40: "violin", 41: "viola", 42: "cello"}
 
 # Writing zero accompaniment notes in a window is a legitimate sample (the
 # model is free to spend the whole window "predicting" more piano), but a
@@ -131,7 +131,7 @@ class LiveDuet:
     """
 
     def __init__(self, model, melody_source, melody_len_s, bpm, lookahead_beats,
-                 commit_beats, listen_first_beats, top_p, accomp_instrs=SOLO_ACCOMP_INSTRS,
+                 commit_beats, listen_first_beats, top_p, accomp_instrs=STRING_ENSEMBLE_ACCOMP_INSTRS,
                  accomp_bias=ACCOMP_BIAS, polyphonic=False, on_played=None, t0=None,
                  poll_interval=0.05):
         self.model = model
@@ -374,19 +374,20 @@ def main():
                      help="logit bias favoring the accompaniment instrument(s) over the "
                           "hallucinated-melody instrument (no coherence cost since the "
                           "latter is always discarded)")
-    ap.add_argument("--ensemble", action="store_true",
-                     help="use both empirically-verified companion voices (violin + steel "
-                          "guitar) instead of one violin -- which instrument(s) play, "
-                          "orthogonal to --multi-voice below")
+    ap.add_argument("--solo", action="store_true",
+                     help="one violin instead of the default string ensemble (violin, viola, "
+                          "cello) -- a lone violin was consistently too sparse against a real "
+                          "performance to be heard; which instrument(s) play, orthogonal to "
+                          "--multi-voice below")
     ap.add_argument("--multi-voice", action="store_true",
-                     help="\"multiple violins\": let each companion instrument overlap "
-                          "itself (a section, not a soloist) instead of enforcing one note "
-                          "at a time per instrument -- how many notes a given instrument "
-                          "can play at once, orthogonal to --ensemble above")
+                     help="let each companion instrument overlap itself (a section, not a "
+                          "soloist) instead of enforcing one note at a time per instrument -- "
+                          "how many notes a given instrument can play at once, orthogonal to "
+                          "--solo above")
     ap.add_argument("--outdir", default=str(Path(__file__).resolve().parent / "output"))
     args = ap.parse_args()
 
-    accomp_instrs = ENSEMBLE_ACCOMP_INSTRS if args.ensemble else SOLO_ACCOMP_INSTRS
+    accomp_instrs = SOLO_ACCOMP_INSTRS if args.solo else STRING_ENSEMBLE_ACCOMP_INSTRS
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
